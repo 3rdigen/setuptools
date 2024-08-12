@@ -16,8 +16,7 @@ from setuptools.dist import Distribution
 
 
 pytestmark = pytest.mark.skipif(
-    'platform.python_implementation() == "PyPy" and '
-    'platform.system() == "Windows"',
+    'platform.python_implementation() == "PyPy" and platform.system() == "Windows"',
     reason="pypa/setuptools#2496",
 )
 
@@ -40,8 +39,7 @@ def setup_module(module):
 
 @pytest.fixture
 def install_context(request, tmpdir, monkeypatch):
-    """Fixture to set up temporary installation directory.
-    """
+    """Fixture to set up temporary installation directory."""
     # Save old values so we can restore them.
     new_cwd = tmpdir.mkdir('cwd')
     user_base = tmpdir.mkdir('user_base')
@@ -66,7 +64,7 @@ def install_context(request, tmpdir, monkeypatch):
     monkeypatch.setattr('site.USER_BASE', user_base.strpath)
     monkeypatch.setattr('site.USER_SITE', user_site.strpath)
     monkeypatch.setattr('sys.path', sys.path + [install_dir.strpath])
-    monkeypatch.setenv(str('PYTHONPATH'), str(os.path.pathsep.join(sys.path)))
+    monkeypatch.setenv('PYTHONPATH', str(os.path.pathsep.join(sys.path)))
 
     # Set up the command for performing the installation.
     dist = Distribution()
@@ -86,25 +84,28 @@ def _install_one(requirement, cmd, pkgname, modulename):
 
 
 def test_stevedore(install_context):
-    _install_one('stevedore', install_context,
-                 'stevedore', 'extension.py')
+    _install_one('stevedore', install_context, 'stevedore', 'extension.py')
 
 
 @pytest.mark.xfail
 def test_virtualenvwrapper(install_context):
-    _install_one('virtualenvwrapper', install_context,
-                 'virtualenvwrapper', 'hook_loader.py')
+    _install_one(
+        'virtualenvwrapper', install_context, 'virtualenvwrapper', 'hook_loader.py'
+    )
 
 
 def test_pbr(install_context):
-    _install_one('pbr', install_context,
-                 'pbr', 'core.py')
+    _install_one('pbr', install_context, 'pbr', 'core.py')
 
 
 @pytest.mark.xfail
+@pytest.mark.filterwarnings("ignore:'encoding' argument not specified")
+# ^-- Dependency chain: `python-novaclient` < `oslo-utils` < `netifaces==0.11.0`
+#     netifaces' setup.py uses `open` without `encoding="utf-8"` which is hijacked by
+#     `setuptools.sandbox._open` and triggers the EncodingWarning.
+#     Can't use EncodingWarning in the filter, as it does not exist on Python < 3.10.
 def test_python_novaclient(install_context):
-    _install_one('python-novaclient', install_context,
-                 'novaclient', 'base.py')
+    _install_one('python-novaclient', install_context, 'novaclient', 'base.py')
 
 
 def test_pyuri(install_context):

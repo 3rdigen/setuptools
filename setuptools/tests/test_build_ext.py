@@ -98,12 +98,11 @@ class TestBuildExt:
         ext3 = Extension("ext3", ["c-extension/ext3.c"])
 
         path.build(files)
-        dist = Distribution({
+        return Distribution({
             "script_name": "%test%",
             "ext_modules": [ext1, ext2, ext3],
             "package_dir": {"": "src"},
         })
-        return dist
 
     def test_get_outputs(self, tmpdir_cwd, monkeypatch):
         monkeypatch.setenv('SETUPTOOLS_EXT_SUFFIX', '.mp3')  # make test OS-independent
@@ -190,6 +189,7 @@ class TestBuildExtInplace:
         dist = Distribution(dict(ext_modules=[extension]))
         dist.script_name = 'setup.py'
         cmd = build_ext(dist)
+        # TODO: False-positive [attr-defined], raise upstream
         vars(cmd).update(build_lib=".build/lib", build_temp=".build/tmp", **opts)
         cmd.ensure_finalized()
         return cmd
@@ -233,7 +233,8 @@ def test_build_ext_config_handling(tmpdir_cwd):
                 version='0.0.0',
                 ext_modules=[Extension('foo', ['foo.c'])],
             )
-            """),
+            """
+        ),
         'foo.c': DALS(
             """
             #include "Python.h"
@@ -275,15 +276,18 @@ def test_build_ext_config_handling(tmpdir_cwd):
                 return module;
             #endif
             }
-            """),
+            """
+        ),
         'setup.cfg': DALS(
             """
             [build]
             build_base = foo_build
-            """),
+            """
+        ),
     }
     path.build(files)
     code, output = environment.run_setup_py(
-        cmd=['build'], data_stream=(0, 2),
+        cmd=['build'],
+        data_stream=(0, 2),
     )
     assert code == 0, '\nSTDOUT:\n%s\nSTDERR:\n%s' % output

@@ -2,12 +2,18 @@
 Load setuptools configuration from ``setup.cfg`` files.
 
 **API will be made private in the future**
+
+To read project metadata, consider using
+``build.util.project_wheel_metadata`` (https://pypi.org/project/build/).
+For simple scenarios, you can also try parsing the file directly
+with the help of ``configparser``.
 """
-import os
+
+from __future__ import annotations
 
 import contextlib
 import functools
-import warnings
+import os
 from collections import defaultdict
 from functools import partial
 from functools import wraps
@@ -18,28 +24,26 @@ from typing import (
     Dict,
     Generic,
     Iterable,
-    List,
-    Optional,
-    Set,
+    Iterator,
     Tuple,
     TypeVar,
     Union,
 )
 
-from distutils.errors import DistutilsOptionError, DistutilsFileError
-from setuptools.extern.packaging.requirements import Requirement, InvalidRequirement
-from setuptools.extern.packaging.markers import default_environment as marker_env
-from setuptools.extern.packaging.version import Version, InvalidVersion
-from setuptools.extern.packaging.specifiers import SpecifierSet
-from setuptools._deprecation_warning import SetuptoolsDeprecationWarning
-
+from .._path import StrPath
+from ..errors import FileError, OptionError
+from packaging.markers import default_environment as marker_env
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.version import InvalidVersion, Version
+from ..warnings import SetuptoolsDeprecationWarning
 from . import expand
 
 if TYPE_CHECKING:
-    from setuptools.dist import Distribution  # noqa
-    from distutils.dist import DistributionMetadata  # noqa
+    from distutils.dist import DistributionMetadata
 
-_Path = Union[str, os.PathLike]
+    from setuptools.dist import Distribution
+
 SingleCommandOptions = Dict["str", Tuple["str", Any]]
 """Dict that associate the name of the options of a particular command to a
 tuple. The first element of the tuple indicates the origin of the option value
@@ -51,7 +55,7 @@ Target = TypeVar("Target", bound=Union["Distribution", "DistributionMetadata"])
 
 
 def read_configuration(
-    filepath: _Path, find_others=False, ignore_option_errors=False
+    filepath: StrPath, find_others=False, ignore_option_errors=False
 ) -> dict:
     """Read given configuration file and returns options from it as a dict.
 
@@ -76,7 +80,7 @@ def read_configuration(
     return configuration_to_dict(handlers)
 
 
-def apply_configuration(dist: "Distribution", filepath: _Path) -> "Distribution":
+def apply_configuration(dist: Distribution, filepath: StrPath) -> Distribution:
     """Apply the configuration from a ``setup.cfg`` file into an existing
     distribution object.
     """
@@ -86,25 +90,25 @@ def apply_configuration(dist: "Distribution", filepath: _Path) -> "Distribution"
 
 
 def _apply(
-    dist: "Distribution",
-    filepath: _Path,
-    other_files: Iterable[_Path] = (),
+    dist: Distribution,
+    filepath: StrPath,
+    other_files: Iterable[StrPath] = (),
     ignore_option_errors: bool = False,
-) -> Tuple["ConfigHandler", ...]:
+) -> tuple[ConfigHandler, ...]:
     """Read configuration from ``filepath`` and applies to the ``dist`` object."""
     from setuptools.dist import _Distribution
 
     filepath = os.path.abspath(filepath)
 
     if not os.path.isfile(filepath):
-        raise DistutilsFileError('Configuration file %s does not exist.' % filepath)
+        raise FileError(f'Configuration file {filepath} does not exist.')
 
     current_directory = os.getcwd()
     os.chdir(os.path.dirname(filepath))
     filenames = [*other_files, filepath]
 
     try:
-        _Distribution.parse_config_files(dist, filenames=filenames)
+        _Distribution.parse_config_files(dist, filenames=filenames)  # type: ignore[arg-type] # TODO: fix in distutils stubs
         handlers = parse_configuration(
             dist, dist.command_options, ignore_option_errors=ignore_option_errors
         )
@@ -121,13 +125,13 @@ def _get_option(target_obj: Target, key: str):
     the target object, either through a get_{key} method or
     from an attribute directly.
     """
-    getter_name = 'get_{key}'.format(**locals())
+    getter_name = f'get_{key}'
     by_attribute = functools.partial(getattr, target_obj, key)
     getter = getattr(target_obj, getter_name, by_attribute)
     return getter()
 
 
-def configuration_to_dict(handlers: Tuple["ConfigHandler", ...]) -> dict:
+def configuration_to_dict(handlers: tuple[ConfigHandler, ...]) -> dict:
     """Returns configuration data gathered by given handlers as a dict.
 
     :param list[ConfigHandler] handlers: Handlers list,
@@ -146,10 +150,10 @@ def configuration_to_dict(handlers: Tuple["ConfigHandler", ...]) -> dict:
 
 
 def parse_configuration(
-    distribution: "Distribution",
+    distribution: Distribution,
     command_options: AllCommandOptions,
     ignore_option_errors=False,
-) -> Tuple["ConfigMetadataHandler", "ConfigOptionsHandler"]:
+) -> tuple[ConfigMetadataHandler, ConfigOptionsHandler]:
     """Performs additional parsing of configuration options
     for a distribution.
 
@@ -212,19 +216,14 @@ def _warn_accidental_env_marker_misconfig(label: str, orig_value: str, parsed: l
         return
 
     markers = marker_env().keys()
-    msg = (
-        f"One of the parsed requirements in `{label}` "
-        f"looks like a valid environment marker: '{parsed[1]}'\n"
-        "Make sure that the config is correct and check "
-        "https://setuptools.pypa.io/en/latest/userguide/declarative_config.html#opt-2"  # noqa: E501
-    )
 
     try:
         req = Requirement(parsed[1])
         if req.name in markers:
-            warnings.warn(msg)
+            _AmbiguousMarker.emit(field=label, req=parsed[1])
     except InvalidRequirement as ex:
         if any(parsed[1].startswith(marker) for marker in markers):
+            msg = _AmbiguousMarker.message(field=label, req=parsed[1])
             raise InvalidRequirement(msg) from ex
 
 
@@ -237,7 +236,7 @@ class ConfigHandler(Generic[Target]):
 
     """
 
-    aliases: Dict[str, str] = {}
+    aliases: dict[str, str] = {}
     """Options aliases.
     For compatibility with various packages. E.g.: d2to1 and pbr.
     Note: `-` in keys is replaced with `_` by config parser.
@@ -254,15 +253,17 @@ class ConfigHandler(Generic[Target]):
         self.ignore_option_errors = ignore_option_errors
         self.target_obj = target_obj
         self.sections = dict(self._section_options(options))
-        self.set_options: List[str] = []
+        self.set_options: list[str] = []
         self.ensure_discovered = ensure_discovered
-        self._referenced_files: Set[str] = set()
+        self._referenced_files: set[str] = set()
         """After parsing configurations, this property will enumerate
         all files referenced by the "file:" directive. Private API for setuptools only.
         """
 
     @classmethod
-    def _section_options(cls, options: AllCommandOptions):
+    def _section_options(
+        cls, options: AllCommandOptions
+    ) -> Iterator[tuple[str, SingleCommandOptions]]:
         for full_name, value in options.items():
             pre, sep, name = full_name.partition(cls.section_prefix)
             if pre:
@@ -284,8 +285,8 @@ class ConfigHandler(Generic[Target]):
 
         try:
             current_value = getattr(target_obj, option_name)
-        except AttributeError:
-            raise KeyError(option_name)
+        except AttributeError as e:
+            raise KeyError(option_name) from e
 
         if current_value:
             # Already inhabited. Skipping.
@@ -334,9 +335,7 @@ class ConfigHandler(Generic[Target]):
         for line in cls._parse_list(value):
             key, sep, val = line.partition(separator)
             if sep != separator:
-                raise DistutilsOptionError(
-                    'Unable to parse option value to dict: %s' % value
-                )
+                raise OptionError(f"Unable to parse option value to dict: {value}")
             result[key.strip()] = val.strip()
 
         return result
@@ -374,7 +373,7 @@ class ConfigHandler(Generic[Target]):
 
         return parser
 
-    def _parse_file(self, value, root_dir: _Path):
+    def _parse_file(self, value, root_dir: StrPath):
         """Represents value as a string, allowing including text
         from nearest files using `file:` directive.
 
@@ -400,7 +399,7 @@ class ConfigHandler(Generic[Target]):
         self._referenced_files.update(filepaths)
         return expand.read_files(filepaths, root_dir)
 
-    def _parse_attr(self, value, package_dir, root_dir: _Path):
+    def _parse_attr(self, value, package_dir, root_dir: StrPath):
         """Represents value as a module attribute.
 
         Examples:
@@ -478,7 +477,7 @@ class ConfigHandler(Generic[Target]):
                 # Keep silent for a new option may appear anytime.
                 self[name] = value
 
-    def parse(self):
+    def parse(self) -> None:
         """Parses configuration file items from one
         or more related sections.
 
@@ -488,7 +487,7 @@ class ConfigHandler(Generic[Target]):
             if section_name:  # [section.option] variant
                 method_postfix = '_%s' % section_name
 
-            section_parser_method: Optional[Callable] = getattr(
+            section_parser_method: Callable | None = getattr(
                 self,
                 # Dots in section names are translated into dunderscores.
                 ('parse_section%s' % method_postfix).replace('.', '__'),
@@ -496,24 +495,24 @@ class ConfigHandler(Generic[Target]):
             )
 
             if section_parser_method is None:
-                raise DistutilsOptionError(
-                    'Unsupported distribution option section: [%s.%s]'
-                    % (self.section_prefix, section_name)
+                raise OptionError(
+                    "Unsupported distribution option section: "
+                    f"[{self.section_prefix}.{section_name}]"
                 )
 
             section_parser_method(section_options)
 
-    def _deprecated_config_handler(self, func, msg, warning_class):
+    def _deprecated_config_handler(self, func, msg, **kw):
         """this function will wrap around parameters that are deprecated
 
         :param msg: deprecation message
-        :param warning_class: class of warning exception to be raised
         :param func: function to be wrapped around
         """
 
         @wraps(func)
         def config_handler(*args, **kwargs):
-            warnings.warn(msg, warning_class)
+            kw.setdefault("stacklevel", 2)
+            _DeprecatedConfig.emit("Deprecated config in `setup.cfg`", msg, **kw)
             return func(*args, **kwargs)
 
         return config_handler
@@ -537,12 +536,12 @@ class ConfigMetadataHandler(ConfigHandler["DistributionMetadata"]):
 
     def __init__(
         self,
-        target_obj: "DistributionMetadata",
+        target_obj: DistributionMetadata,
         options: AllCommandOptions,
         ignore_option_errors: bool,
         ensure_discovered: expand.EnsurePackagesDiscovered,
-        package_dir: Optional[dict] = None,
-        root_dir: _Path = os.curdir,
+        package_dir: dict | None = None,
+        root_dir: StrPath = os.curdir,
     ):
         super().__init__(target_obj, options, ignore_option_errors, ensure_discovered)
         self.package_dir = package_dir
@@ -560,21 +559,9 @@ class ConfigMetadataHandler(ConfigHandler["DistributionMetadata"]):
             'platforms': parse_list,
             'keywords': parse_list,
             'provides': parse_list,
-            'requires': self._deprecated_config_handler(
-                parse_list,
-                "The requires parameter is deprecated, please use "
-                "install_requires for runtime dependencies.",
-                SetuptoolsDeprecationWarning,
-            ),
             'obsoletes': parse_list,
             'classifiers': self._get_parser_compound(parse_file, parse_list),
             'license': exclude_files_parser('license'),
-            'license_file': self._deprecated_config_handler(
-                exclude_files_parser('license_file'),
-                "The license_file parameter is deprecated, "
-                "use license_files instead.",
-                SetuptoolsDeprecationWarning,
-            ),
             'license_files': parse_list,
             'description': parse_file,
             'long_description': parse_file,
@@ -597,12 +584,11 @@ class ConfigMetadataHandler(ConfigHandler["DistributionMetadata"]):
             # accidentally include newlines and other unintended content
             try:
                 Version(version)
-            except InvalidVersion:
-                tmpl = (
-                    'Version loaded from {value} does not '
-                    'comply with PEP 440: {version}'
-                )
-                raise DistutilsOptionError(tmpl.format(**locals()))
+            except InvalidVersion as e:
+                raise OptionError(
+                    f'Version loaded from {value} does not '
+                    f'comply with PEP 440: {version}'
+                ) from e
 
             return version
 
@@ -614,14 +600,14 @@ class ConfigOptionsHandler(ConfigHandler["Distribution"]):
 
     def __init__(
         self,
-        target_obj: "Distribution",
+        target_obj: Distribution,
         options: AllCommandOptions,
         ignore_option_errors: bool,
         ensure_discovered: expand.EnsurePackagesDiscovered,
     ):
         super().__init__(target_obj, options, ignore_option_errors, ensure_discovered)
         self.root_dir = target_obj.src_root
-        self.package_dir: Dict[str, str] = {}  # To be filled by `find_packages`
+        self.package_dir: dict[str, str] = {}  # To be filled by `find_packages`
 
     @classmethod
     def _parse_list_semicolon(cls, value):
@@ -657,13 +643,12 @@ class ConfigOptionsHandler(ConfigHandler["Distribution"]):
                 parse_list,
                 "The namespace_packages parameter is deprecated, "
                 "consider using implicit namespaces instead (PEP 420).",
-                SetuptoolsDeprecationWarning,
+                # TODO: define due date, see setuptools.dist:check_nsp.
             ),
             'install_requires': partial(
                 self._parse_requirements_list, "install_requires"
             ),
             'setup_requires': self._parse_list_semicolon,
-            'tests_require': self._parse_list_semicolon,
             'packages': self._parse_packages,
             'entry_points': self._parse_file_in_root,
             'py_modules': parse_list,
@@ -711,9 +696,9 @@ class ConfigOptionsHandler(ConfigHandler["Distribution"]):
 
         valid_keys = ['where', 'include', 'exclude']
 
-        find_kwargs = dict(
-            [(k, v) for k, v in section_data.items() if k in valid_keys and v]
-        )
+        find_kwargs = dict([
+            (k, v) for k, v in section_data.items() if k in valid_keys and v
+        ])
 
         where = find_kwargs.get('where')
         if where is not None:
@@ -766,3 +751,27 @@ class ConfigOptionsHandler(ConfigHandler["Distribution"]):
         """
         parsed = self._parse_section_to_dict(section_options, self._parse_list)
         self['data_files'] = expand.canonic_data_files(parsed, self.root_dir)
+
+
+class _AmbiguousMarker(SetuptoolsDeprecationWarning):
+    _SUMMARY = "Ambiguous requirement marker."
+    _DETAILS = """
+    One of the parsed requirements in `{field}` looks like a valid environment marker:
+
+        {req!r}
+
+    Please make sure that the configuration file is correct.
+    You can use dangling lines to avoid this problem.
+    """
+    _SEE_DOCS = "userguide/declarative_config.html#opt-2"
+    # TODO: should we include due_date here? Initially introduced in 6 Aug 2022.
+    # Does this make sense with latest version of packaging?
+
+    @classmethod
+    def message(cls, **kw):
+        docs = f"https://setuptools.pypa.io/en/latest/{cls._SEE_DOCS}"
+        return cls._format(cls._SUMMARY, cls._DETAILS, see_url=docs, format_args=kw)
+
+
+class _DeprecatedConfig(SetuptoolsDeprecationWarning):
+    _SEE_DOCS = "userguide/declarative_config.html"
